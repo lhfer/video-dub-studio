@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+.venv*/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime outputs
+output/
+*.log
+
+# App local data
+.video-dub-studio/
+
+# IDE
+.vscode/
+.idea/
+
+# Temp
+*.tmp
+tmp/
+
+# App packaging staging
+/gui_app/dmg_staging/
+/gui_app/__pycache__/
+/src/__pycache__/
