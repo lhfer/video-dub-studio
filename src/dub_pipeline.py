@@ -10,13 +10,15 @@ import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Mapping
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
 import dashscope
-from dashscope.audio.asr import Recognition
+from dashscope.audio.asr import Recognition, Transcription
 from dashscope import MultiModalConversation
+from dashscope.utils.oss_utils import upload_file
 from openai import OpenAI
 
 try:
@@ -49,8 +51,10 @@ class SpeakerProfile:
 
 
 DEFAULT_TTS_VOICES = ["Cherry", "Ethan", "Serena", "Chelsie", "Sunny", "Dylan"]
-MAX_TTS_INPUT_CHARS = 500
-MAX_TTS_INPUT_BYTES = 480
+# Keep TTS chunks conservative to reduce model-side length rejections on
+# different languages/encodings and runtime environments.
+MAX_TTS_INPUT_CHARS = 220
+MAX_TTS_INPUT_BYTES = 300
 TLS_MODE_AUTO = "auto"
 TLS_MODE_SYSTEM = "system"
 TLS_MODE_CERTIFI = "certifi"
@@ -77,6 +81,42 @@ _TLS_MODE = "default"
 _TLS_EFFECTIVE_CA_FILE = ""
 _TLS_CONFIGURED = False
 _TLS_ACTIVE_KEY: tuple[str, str] = ("", "")
+_DASHSCOPE_CERTIFI_ORIG_MODULE = None
+
+
+class _DashscopeCertifiProxy:
+    def __init__(self, real_module, where_func):
+        self._real = real_module
+        self.where = where_func
+
+    def __getattr__(self, item):
+        return getattr(self._real, item)
+
+
+def _patch_dashscope_certifi_where(mode_norm: str, ca_file: str = "") -> None:
+    global _DASHSCOPE_CERTIFI_ORIG_MODULE
+    try:
+        from dashscope.api_entities import http_request as dashscope_http_request
+    except Exception:
+        return
+    current_mod = getattr(dashscope_http_request, "certifi", None)
+    if current_mod is None:
+        return
+
+    if _DASHSCOPE_CERTIFI_ORIG_MODULE is None:
+        _DASHSCOPE_CERTIFI_ORIG_MODULE = current_mod
+    real_mod = _DASHSCOPE_CERTIFI_ORIG_MODULE
+
+    if mode_norm in {TLS_MODE_CERTIFI, TLS_MODE_CUSTOM_CA} and ca_file:
+        dashscope_http_request.certifi = _DashscopeCertifiProxy(real_mod, lambda p=ca_file: p)
+        return
+
+    if mode_norm in {TLS_MODE_SYSTEM, TLS_MODE_DEFAULT}:
+        # Let ssl.create_default_context(cafile=None) use system trust store.
+        dashscope_http_request.certifi = _DashscopeCertifiProxy(real_mod, lambda: None)
+        return
+
+    dashscope_http_request.certifi = real_mod
 
 
 def _norm_tls_mode(mode: str) -> str:
@@ -140,6 +180,7 @@ def configure_tls_trust(mode: Optional[str] = None, ca_bundle_file: Optional[str
         if truststore is None:
             raise RuntimeError("TLS 模式 system 需要 truststore 依赖，但当前不可用")
         truststore.inject_into_ssl()
+        _patch_dashscope_certifi_where(TLS_MODE_SYSTEM)
         _TLS_MODE = "system-truststore"
         _TLS_CONFIGURED = True
         return _TLS_MODE
@@ -150,6 +191,7 @@ def configure_tls_trust(mode: Optional[str] = None, ca_bundle_file: Optional[str
         ca_file = certifi.where()
         _apply_ca_bundle(ca_file)
         _TLS_EFFECTIVE_CA_FILE = ca_file
+        _patch_dashscope_certifi_where(TLS_MODE_CERTIFI, ca_file)
         _TLS_MODE = "certifi-bundle"
         _TLS_CONFIGURED = True
         return _TLS_MODE
@@ -160,11 +202,13 @@ def configure_tls_trust(mode: Optional[str] = None, ca_bundle_file: Optional[str
         ca_file = _build_custom_ca_bundle(ca_norm)
         _apply_ca_bundle(ca_file)
         _TLS_EFFECTIVE_CA_FILE = ca_file
+        _patch_dashscope_certifi_where(TLS_MODE_CUSTOM_CA, ca_file)
         _TLS_MODE = f"custom-ca:{ca_file}"
         _TLS_CONFIGURED = True
         return _TLS_MODE
 
     if mode_norm == TLS_MODE_DEFAULT:
+        _patch_dashscope_certifi_where(TLS_MODE_DEFAULT)
         _TLS_MODE = "python-default"
         _TLS_CONFIGURED = True
         return _TLS_MODE
@@ -173,6 +217,7 @@ def configure_tls_trust(mode: Optional[str] = None, ca_bundle_file: Optional[str
     if truststore is not None:
         try:
             truststore.inject_into_ssl()
+            _patch_dashscope_certifi_where(TLS_MODE_SYSTEM)
             _TLS_MODE = "system-truststore"
             _TLS_CONFIGURED = True
             return _TLS_MODE
@@ -183,12 +228,14 @@ def configure_tls_trust(mode: Optional[str] = None, ca_bundle_file: Optional[str
             ca_file = certifi.where()
             _apply_ca_bundle(ca_file)
             _TLS_EFFECTIVE_CA_FILE = ca_file
+            _patch_dashscope_certifi_where(TLS_MODE_CERTIFI, ca_file)
             _TLS_MODE = "certifi-bundle"
             _TLS_CONFIGURED = True
             return _TLS_MODE
         except Exception:
             pass
 
+    _patch_dashscope_certifi_where(TLS_MODE_DEFAULT)
     _TLS_MODE = "python-default"
     _TLS_CONFIGURED = True
     return _TLS_MODE
@@ -208,7 +255,364 @@ def current_tls_verify_arg() -> object:
 
 def _is_ssl_cert_error(err: Exception) -> bool:
     text = str(err).lower()
-    return ("certificate verify failed" in text) or ("cert_verify_failed" in text)
+    return (
+        ("certificate verify failed" in text)
+        or ("cert_verify_failed" in text)
+        or ("sslcertverificationerror" in text)
+        or ("unable to get local issuer certificate" in text)
+        or ("self signed certificate" in text)
+        or ("tlsv1 alert unknown ca" in text)
+    )
+
+
+def _compact_error(err: Exception, max_len: int = 320) -> str:
+    text = re.sub(r"\s+", " ", str(err or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def websocket_base_url_from_http_api(api_url: str) -> str:
+    src = str(api_url or "").strip() or "https://dashscope.aliyuncs.com/api/v1"
+    parsed = urlparse(src)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    host = parsed.netloc or "dashscope.aliyuncs.com"
+    path = parsed.path or "/api/v1"
+    m = re.search(r"/api/([^/]+)", path)
+    version = m.group(1) if m else "v1"
+    return f"{scheme}://{host}/api-ws/{version}/inference"
+
+
+def _configure_dashscope_runtime(api_key: str, api_url: str) -> None:
+    http_base = str(api_url or "").strip().rstrip("/")
+    if not http_base:
+        http_base = "https://dashscope.aliyuncs.com/api/v1"
+    ws_base = websocket_base_url_from_http_api(http_base)
+
+    dashscope.api_key = api_key
+    os.environ["DASHSCOPE_API_KEY"] = api_key
+    os.environ["DASHSCOPE_HTTP_BASE_URL"] = http_base
+    os.environ["DASHSCOPE_WEBSOCKET_BASE_URL"] = ws_base
+    # dashscope module loads these at import time; assign explicitly at runtime.
+    try:
+        dashscope.base_http_api_url = http_base
+    except Exception:
+        pass
+    try:
+        dashscope.base_websocket_api_url = ws_base
+    except Exception:
+        pass
+
+
+def _speaker_label(raw: object) -> str:
+    if isinstance(raw, int):
+        return f"S{raw + 1}" if raw >= 0 else "S1"
+    txt = str(raw or "").strip()
+    if not txt:
+        return "S1"
+    if txt.upper().startswith("S"):
+        return txt.upper()
+    if txt.isdigit():
+        try:
+            return f"S{int(txt) + 1}"
+        except Exception:
+            return "S1"
+    return "S1"
+
+
+_TEXT_KEYS = ("text", "transcript", "content", "sentence")
+_START_KEYS = ("begin_time", "start_time", "start", "begin", "offset", "begin_ms", "start_ms")
+_END_KEYS = ("end_time", "stop_time", "end", "current_time", "end_ms", "stop_ms")
+
+
+def _first_non_none(mapping: Mapping[str, object], keys: Sequence[str]) -> object:
+    for k in keys:
+        if k in mapping and mapping.get(k) is not None:
+            return mapping.get(k)
+    return None
+
+
+def _first_text(mapping: Mapping[str, object]) -> str:
+    for k in _TEXT_KEYS:
+        if k in mapping:
+            v = mapping.get(k)
+            if isinstance(v, str):
+                t = v.strip()
+                if t:
+                    return t
+    return ""
+
+
+def _extract_sentence_entries(payload: object) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def _append(text: str, begin: object, end: object, speaker: object, has_time: bool) -> None:
+        t = str(text or "").strip()
+        if not t:
+            return
+        b_key = "" if begin is None else str(begin)
+        e_key = "" if end is None else str(end)
+        s_key = "" if speaker is None else str(speaker)
+        key = (t, b_key, e_key, s_key)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(
+            {
+                "begin": begin,
+                "end": end,
+                "speaker": speaker,
+                "text": t,
+                "has_time": bool(has_time and begin is not None and end is not None),
+            }
+        )
+
+    def _ingest_dict(d: Mapping[str, object], parent_speaker: object = None) -> None:
+        spk = d.get("speaker_id", d.get("speaker", parent_speaker))
+        text = _first_text(d)
+        b = _first_non_none(d, _START_KEYS)
+        e = _first_non_none(d, _END_KEYS)
+        if text:
+            _append(text, b, e, spk, has_time=(b is not None and e is not None))
+
+    if isinstance(payload, dict):
+        for container_key in ("transcripts", "sentences", "paragraphs", "utterances", "segments", "items", "chunks"):
+            container = payload.get(container_key)
+            if not isinstance(container, list):
+                continue
+            for item in container:
+                if not isinstance(item, dict):
+                    continue
+                parent_speaker = item.get("speaker_id", item.get("speaker", None))
+                _ingest_dict(item, parent_speaker=parent_speaker)
+                nested_sentences = item.get("sentences")
+                if isinstance(nested_sentences, list):
+                    for s in nested_sentences:
+                        if isinstance(s, dict):
+                            _ingest_dict(s, parent_speaker=parent_speaker)
+
+    def _scan(node: object, parent_speaker: object = None) -> None:
+        if isinstance(node, dict):
+            spk = node.get("speaker_id", node.get("speaker", parent_speaker))
+            _ingest_dict(node, parent_speaker=spk)
+            for v in node.values():
+                _scan(v, parent_speaker=spk)
+        elif isinstance(node, list):
+            for item in node:
+                _scan(item, parent_speaker=parent_speaker)
+
+    _scan(payload)
+
+    # Last-resort: preserve plain text even if no timestamps are returned.
+    # Downstream normalize_segments() will rebuild timeline by text length.
+    if not rows:
+        text_blocks: List[str] = []
+
+        def _collect_text(node: object) -> None:
+            if isinstance(node, dict):
+                txt = _first_text(node)
+                if txt and txt not in text_blocks:
+                    text_blocks.append(txt)
+                for v in node.values():
+                    _collect_text(v)
+            elif isinstance(node, list):
+                for item in node:
+                    _collect_text(item)
+
+        _collect_text(payload)
+        for t in text_blocks:
+            _append(t, 0.0, 0.0, "S1", has_time=False)
+    return rows
+
+
+def _entries_to_segments(entries: List[Dict[str, object]]) -> List[dict]:
+    if not entries:
+        return []
+    raw_pairs: List[tuple[float, float]] = []
+    norm_entries: List[Dict[str, object]] = []
+    for item in entries:
+        has_time = bool(item.get("has_time", True))
+        if has_time:
+            try:
+                b = float(item.get("begin", 0.0))
+                e = float(item.get("end", b))
+            except Exception:
+                b = 0.0
+                e = 0.0
+                has_time = False
+        else:
+            b = 0.0
+            e = 0.0
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        if has_time and e <= b:
+            e = b + 0.2
+        if has_time:
+            raw_pairs.append((b, e))
+        norm_entries.append({"begin": b, "end": e, "speaker": item.get("speaker"), "text": text, "has_time": has_time})
+    if not norm_entries:
+        return []
+
+    diffs = [max(0.0, e - b) for b, e in raw_pairs]
+    ends = [max(0.0, e) for _, e in raw_pairs]
+    median_diff = float(np.median(diffs)) if diffs else 0.0
+    median_end = float(np.median(ends)) if ends else 0.0
+    use_ms = (median_diff > 80.0) or (median_end > 10000.0)
+    scale = 1000.0 if use_ms else 1.0
+
+    segments: List[dict] = []
+    for item in norm_entries:
+        has_time = bool(item.get("has_time", True))
+        if has_time:
+            start = float(item["begin"]) / scale
+            end = float(item["end"]) / scale
+            if end <= start:
+                end = start + 0.2
+        else:
+            start = 0.0
+            end = 0.0
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "speaker": _speaker_label(item.get("speaker")),
+                "text": str(item["text"]),
+            }
+        )
+    segments.sort(key=lambda x: float(x["start"]))
+    return segments
+
+
+def _fetch_transcription_payloads(output: object) -> List[object]:
+    out = output if isinstance(output, dict) else {}
+    payloads: List[object] = []
+    top_level_url = str(
+        out.get("transcription_url", out.get("result_url", out.get("url", out.get("file_url", ""))))
+    ).strip()
+    if top_level_url:
+        resp = requests.get(top_level_url, timeout=120, verify=current_tls_verify_arg())
+        resp.raise_for_status()
+        payloads.append(resp.json())
+        return payloads
+    result_nodes: List[object] = []
+    for key in ("results", "result", "task_results", "subtasks", "items"):
+        v = out.get(key)
+        if isinstance(v, list):
+            result_nodes.extend(v)
+        elif isinstance(v, dict):
+            result_nodes.append(v)
+    if result_nodes:
+        for item in result_nodes:
+            if not isinstance(item, dict):
+                continue
+            sub_status = str(item.get("subtask_status", item.get("task_status", ""))).strip().upper()
+            if sub_status and sub_status not in {"SUCCEEDED", "SUCCESS", "DONE"}:
+                continue
+            t_url = str(
+                item.get(
+                    "transcription_url",
+                    item.get("result_url", item.get("url", item.get("file_url", ""))),
+                )
+            ).strip()
+            if t_url:
+                resp = requests.get(t_url, timeout=120, verify=current_tls_verify_arg())
+                resp.raise_for_status()
+                payloads.append(resp.json())
+            else:
+                payloads.append(item)
+    if not payloads:
+        payloads.append(out)
+    return payloads
+
+
+def _asr_with_qwen_http_fallback(
+    api_key: str,
+    model: str,
+    audio_path: str,
+    api_url: str,
+) -> dict:
+    # Fallback path for machines where websocket TLS fails:
+    # upload local file to OSS then call HTTP batch transcription.
+    candidates: List[str] = []
+    for m in [model, "fun-asr", "paraformer-v1"]:
+        mm = str(m or "").strip()
+        if mm and mm not in candidates:
+            candidates.append(mm)
+
+    file_uri = Path(audio_path).resolve().as_uri()
+    last_error: Optional[Exception] = None
+    for trans_model in candidates:
+        try:
+            oss_url = upload_file(model=trans_model, upload_path=file_uri, api_key=api_key)
+            if not oss_url:
+                raise RuntimeError(f"文件上传失败（model={trans_model}）")
+            req_headers: Dict[str, str] = {}
+            if str(oss_url).startswith("oss://"):
+                # Official docs require explicit resolver header for oss:// URL in HTTP calls.
+                req_headers["X-DashScope-OssResourceResolve"] = "enable"
+            task = Transcription.async_call(
+                model=trans_model,
+                file_urls=[str(oss_url)],
+                api_key=api_key,
+                diarization_enabled=True,
+                timestamp_alignment_enabled=True,
+                headers=req_headers if req_headers else None,
+            )
+            if int(getattr(task, "status_code", 0)) != 200:
+                raise RuntimeError(f"提交识别任务失败: {getattr(task, 'code', '')} {getattr(task, 'message', '')}")
+
+            task_output = task.output if isinstance(task.output, dict) else {}
+            task_id = str(task_output.get("task_id", "")).strip()
+            if not task_id:
+                raise RuntimeError("识别任务缺少 task_id")
+
+            done = Transcription.wait(
+                task=task_id,
+                api_key=api_key,
+                headers=req_headers if req_headers else None,
+            )
+            if int(getattr(done, "status_code", 0)) != 200:
+                raise RuntimeError(f"查询识别结果失败: {getattr(done, 'code', '')} {getattr(done, 'message', '')}")
+
+            output = done.output if isinstance(done.output, dict) else {}
+            task_status = str(output.get("task_status", "")).strip().upper()
+            if task_status in {"FAILED", "CANCELED", "UNKNOWN"}:
+                err_code = str(output.get("code", getattr(done, "code", ""))).strip()
+                err_msg = str(output.get("message", getattr(done, "message", ""))).strip()
+                if not err_code or not err_msg:
+                    results = output.get("results")
+                    if isinstance(results, list) and results and isinstance(results[0], dict):
+                        err_code = err_code or str(results[0].get("code", "")).strip()
+                        err_msg = err_msg or str(results[0].get("message", "")).strip()
+                raise RuntimeError(
+                    f"文件识别任务失败（model={trans_model} task_id={task_id} status={task_status} "
+                    f"code={err_code or '-'} message={err_msg or '-'})"
+                )
+            payloads = _fetch_transcription_payloads(output)
+            segments: List[dict] = []
+            for payload in payloads:
+                entries = _extract_sentence_entries(payload)
+                segments.extend(_entries_to_segments(entries))
+            if segments:
+                return {"speaker_profiles": {}, "segments": segments, "asr_backend": "http_transcription"}
+            output_keys = list(output.keys())[:12] if isinstance(output, dict) else []
+            payload_preview = ""
+            try:
+                payload_preview = json.dumps(payloads[0], ensure_ascii=False)[:600] if payloads else ""
+            except Exception:
+                payload_preview = str(payloads[0])[:600] if payloads else ""
+            raise RuntimeError(
+                f"文件识别返回为空（model={trans_model} task_id={task_id} output_keys={output_keys} preview={payload_preview}）"
+            )
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error is not None:
+        raise RuntimeError(f"HTTP 文件识别兜底失败: {last_error}") from last_error
+    raise RuntimeError("HTTP 文件识别兜底失败: 未知错误")
 
 
 def run(cmd: Sequence[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -269,9 +673,7 @@ def asr_with_qwen(
 ) -> dict:
     # Use dedicated file recognition API (paraformer) for robust long audio ASR.
     configure_tls_trust()
-    dashscope.api_key = api_key
-    os.environ["DASHSCOPE_API_KEY"] = api_key
-    os.environ["DASHSCOPE_HTTP_BASE_URL"] = api_url
+    _configure_dashscope_runtime(api_key=api_key, api_url=api_url)
     recog = Recognition(
         model=model,
         callback=None,
@@ -284,15 +686,54 @@ def asr_with_qwen(
             diarization_enabled=True,
             timestamp_alignment_enabled=True,
         )
-    except Exception as e:
-        if _is_ssl_cert_error(e):
+    except Exception as ws_err:
+        try:
+            return _asr_with_qwen_http_fallback(
+                api_key=api_key,
+                model=model,
+                audio_path=audio_path,
+                api_url=api_url,
+            )
+        except Exception as fallback_err:
+            ws_tls = _is_ssl_cert_error(ws_err)
+            fb_tls = _is_ssl_cert_error(fallback_err)
+            ws_msg = _compact_error(ws_err)
+            fb_msg = _compact_error(fallback_err)
+            if ws_tls and fb_tls:
+                raise RuntimeError(
+                    "ASR failed: websocket 与 HTTP 兜底均发生 TLS 证书异常。"
+                    f"websocket={ws_msg}; fallback={fb_msg}"
+                ) from fallback_err
+            if ws_tls:
+                raise RuntimeError(
+                    "ASR failed: websocket TLS 通道不可用，且 HTTP 文件识别兜底失败。"
+                    f"fallback={fb_msg}"
+                ) from fallback_err
+            if fb_tls:
+                raise RuntimeError(
+                    "ASR failed: websocket 调用失败，且 HTTP 兜底发生 TLS 证书异常。"
+                    f"websocket={ws_msg}; fallback={fb_msg}"
+                ) from fallback_err
             raise RuntimeError(
-                f"ASR failed: HTTPS 证书校验失败（TLS 模式: {current_tls_mode()}）。"
-                "请检查本机网络代理/安全网关证书是否已安装，或切换网络后重试。"
-            ) from e
-        raise
+                "ASR failed: websocket 调用失败，且 HTTP 文件识别兜底失败。"
+                f"websocket={ws_msg}; fallback={fb_msg}"
+            ) from fallback_err
     if result.status_code != 200:
-        raise RuntimeError(f"ASR failed: {result.code} {result.message}")
+        ws_err = RuntimeError(f"ASR failed: {result.code} {result.message}")
+        try:
+            return _asr_with_qwen_http_fallback(
+                api_key=api_key,
+                model=model,
+                audio_path=audio_path,
+                api_url=api_url,
+            )
+        except Exception as fallback_err:
+            ws_msg = _compact_error(ws_err)
+            fb_msg = _compact_error(fallback_err)
+            raise RuntimeError(
+                "ASR failed: websocket 返回非 200，且 HTTP 文件识别兜底失败。"
+                f"websocket={ws_msg}; fallback={fb_msg}"
+            ) from fallback_err
     sentences = result.get_sentence()
     if not isinstance(sentences, list) or not sentences:
         raise RuntimeError("ASR returned empty sentences")
@@ -316,7 +757,7 @@ def asr_with_qwen(
         )
     if not segments:
         raise RuntimeError("ASR parsed no valid segments")
-    return {"speaker_profiles": {}, "segments": segments}
+    return {"speaker_profiles": {}, "segments": segments, "asr_backend": "websocket_realtime"}
 
 
 def normalize_segments(raw: List[dict], total_duration: float) -> List[Segment]:
@@ -771,8 +1212,7 @@ def list_supported_voices(
     voices: Sequence[str],
 ) -> List[str]:
     configure_tls_trust()
-    os.environ["DASHSCOPE_API_KEY"] = api_key
-    os.environ["DASHSCOPE_HTTP_BASE_URL"] = api_url
+    _configure_dashscope_runtime(api_key=api_key, api_url=api_url)
     supported: List[str] = []
     for voice in voices:
         rsp = MultiModalConversation.call(
@@ -792,6 +1232,90 @@ def chunked(items: Sequence[Segment], size: int) -> List[List[Segment]]:
     return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
 
+def _extract_json_array_candidate(text: str) -> str:
+    s = strip_json_fence(text or "").strip()
+    if not s:
+        return s
+    start = s.find("[")
+    end = s.rfind("]")
+    if 0 <= start < end:
+        return s[start : end + 1]
+    return s
+
+
+def _parse_translation_json(content: str) -> Dict[int, str]:
+    mapping: Dict[int, str] = {}
+    candidates = [_extract_json_array_candidate(content), strip_json_fence(content or "").strip()]
+    seen: set[str] = set()
+    for cand in candidates:
+        c = cand.strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        try:
+            loaded = json.loads(c)
+        except Exception:
+            loaded = None
+        rows: object = loaded
+        if isinstance(rows, dict):
+            rows = rows.get("items", rows.get("data", []))
+        if isinstance(rows, list):
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                raw_id = item.get("id")
+                text = item.get("zh", item.get("text", item.get("translation", "")))
+                try:
+                    idx = int(raw_id)
+                except Exception:
+                    continue
+                txt = str(text or "").strip()
+                if txt:
+                    mapping[idx] = txt
+        if mapping:
+            return mapping
+
+    # Regex salvage for malformed JSON output.
+    s = _extract_json_array_candidate(content or "")
+    for m in re.finditer(
+        r'"id"\s*:\s*(\d+)\s*,\s*"(?:zh|text|translation)"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"',
+        s,
+        flags=re.S,
+    ):
+        idx = int(m.group(1))
+        raw_txt = m.group(2)
+        try:
+            txt = json.loads(f"\"{raw_txt}\"")
+        except Exception:
+            txt = raw_txt.encode("utf-8", errors="ignore").decode("unicode_escape", errors="ignore")
+        txt = str(txt).strip()
+        if txt:
+            mapping[idx] = txt
+    return mapping
+
+
+def _translate_single_line(
+    client: OpenAI,
+    model: str,
+    text: str,
+    target_language: str,
+) -> str:
+    prompt = (
+        f"Translate the line into natural spoken {target_language}. "
+        "Output translation text only, no JSON, no explanation."
+    )
+    rsp = client.chat.completions.create(
+        model=model,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+    )
+    out = (rsp.choices[0].message.content or "").strip()
+    return out or text
+
+
 def translate_segments_qwen(
     segments: List[Segment],
     api_key: str,
@@ -806,21 +1330,51 @@ def translate_segments_qwen(
     for i, batch in enumerate(batches, start=1):
         payload = [{"id": s.idx, "speaker": s.speaker, "text": s.text_src} for s in batch]
         prompt = (
-            f"Translate English interview lines to natural spoken {target_language}.\n"
-            "Keep meaning and speaking style, return JSON only:\n"
+            f"Translate interview lines to natural spoken {target_language}.\n"
+            "Keep meaning and speaking style.\n"
+            "Return STRICT valid JSON array only, with this schema:\n"
             "[{\"id\": number, \"zh\": string}]"
         )
-        rsp = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-        )
-        content = strip_json_fence(rsp.choices[0].message.content or "")
-        data = json.loads(content)
-        mapping = {int(x["id"]): str(x["zh"]).strip() for x in data}
+        mapping: Dict[int, str] = {}
+        last_error: Optional[Exception] = None
+        for _attempt in range(3):
+            try:
+                rsp = client.chat.completions.create(
+                    model=model,
+                    temperature=0.2,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                )
+                content = rsp.choices[0].message.content or ""
+                mapping = _parse_translation_json(content)
+                if mapping:
+                    break
+                last_error = RuntimeError("empty mapping from translation json")
+            except Exception as e:
+                last_error = e
+                continue
+
+        # Degrade gracefully: backfill missing lines with single-line translation
+        # so one malformed batch never fails the whole task.
+        if len(mapping) < len(batch):
+            for seg in batch:
+                if seg.idx in mapping and mapping[seg.idx].strip():
+                    continue
+                try:
+                    mapping[seg.idx] = _translate_single_line(
+                        client=client,
+                        model=model,
+                        text=seg.text_src,
+                        target_language=target_language,
+                    ).strip()
+                except Exception:
+                    mapping[seg.idx] = seg.text_src
+
+        if not mapping and last_error is not None:
+            raise last_error
+
         for seg in batch:
             seg.text_zh = mapping.get(seg.idx, seg.text_src)
         if progress_callback:
@@ -966,9 +1520,9 @@ def split_tts_text(
 def is_tts_input_too_long_error(err_msg: str) -> bool:
     msg = (err_msg or "").lower()
     return (
-        "invalidparameter" in msg
-        and "input length" in msg
-        and ("[0, 600]" in msg or "range of input length" in msg)
+        ("invalidparameter" in msg or "invalid parameter" in msg)
+        and ("input length" in msg or "length should be" in msg or "out of range" in msg)
+        and ("[0, 600]" in msg or "range of input length" in msg or "600" in msg)
     )
 
 
@@ -1004,8 +1558,7 @@ def qwen_tts_to_file(
     language_type: str = "Chinese",
 ) -> None:
     configure_tls_trust()
-    os.environ["DASHSCOPE_API_KEY"] = api_key
-    os.environ["DASHSCOPE_HTTP_BASE_URL"] = api_url
+    _configure_dashscope_runtime(api_key=api_key, api_url=api_url)
     last_err = "unknown"
     for _ in range(3):
         rsp = MultiModalConversation.call(
@@ -1026,6 +1579,8 @@ def qwen_tts_to_file(
         msg = getattr(rsp, "message", "") if not isinstance(rsp, dict) else str(rsp.get("message", ""))
         status = getattr(rsp, "status_code", "") if not isinstance(rsp, dict) else str(rsp.get("status_code", ""))
         last_err = f"status={status} code={code} message={msg}"
+        if is_tts_input_too_long_error(last_err):
+            break
     raise RuntimeError(f"Qwen TTS failed: {last_err}")
 
 
@@ -1053,13 +1608,16 @@ def qwen_tts_to_file_with_retry_split(
         )
         return
     except RuntimeError as e:
-        if depth >= 4 or (not is_tts_input_too_long_error(str(e))) or len(text.strip()) <= 1:
+        if depth >= 8 or (not is_tts_input_too_long_error(str(e))) or len(text.strip()) <= 1:
             raise
 
     # Input length still rejected by remote side; split harder and retry recursively.
     # Keep each retry chunk much smaller to cover multi-byte languages (ja/zh/ko).
-    next_max_chars = max(40, min(220, len(text) // 2))
-    next_max_bytes = max(120, min(300, utf8_len(text) // 2))
+    level_chars = [180, 140, 110, 90, 70, 55, 45, 35]
+    level_bytes = [240, 200, 170, 150, 130, 110, 95, 80]
+    idx = min(depth, len(level_chars) - 1)
+    next_max_chars = level_chars[idx]
+    next_max_bytes = level_bytes[idx]
     sub_texts = split_tts_text(text, max_chars=next_max_chars, max_bytes=next_max_bytes)
     if len(sub_texts) <= 1:
         mid = max(1, len(text) // 2)

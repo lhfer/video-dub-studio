@@ -7,6 +7,9 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 ROOT = Path.cwd()
 NUMPY_CORE_SUBMODULES = collect_submodules("numpy._core")
 EJS_DATAS = collect_data_files("yt_dlp_ejs", includes=["**/*.js"])
+CERTIFI_DATAS = collect_data_files("certifi", includes=["**/*.pem"])
+TRUSTSTORE_SUBMODULES = collect_submodules("truststore")
+CERTIFI_SUBMODULES = collect_submodules("certifi")
 BUNDLED_BINARIES = []
 for tool in ("ffmpeg", "ffprobe", "deno"):
     path = shutil.which(tool)
@@ -19,8 +22,8 @@ a = Analysis(
     [str(ROOT / "gui_app" / "main.py")],
     pathex=[str(ROOT), str(ROOT / "gui_app")],
     binaries=BUNDLED_BINARIES,
-    datas=EJS_DATAS,
-    hiddenimports=NUMPY_CORE_SUBMODULES,
+    datas=EJS_DATAS + CERTIFI_DATAS,
+    hiddenimports=NUMPY_CORE_SUBMODULES + TRUSTSTORE_SUBMODULES + CERTIFI_SUBMODULES,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

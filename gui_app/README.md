@@ -33,10 +33,15 @@ SKIP_BUILD=1 ./gui_app/build_dmg.sh
 - 打包产物已内置 `ffmpeg/ffprobe/deno`，分享给其他人时无需额外安装。
 - 已集成 `yt-dlp-ejs`，用于 YouTube JS challenge 解析，降低“有预览但无可下载格式”的概率。
 - 已加入 TLS 证书兼容层，并支持 GUI 切换：
-  - 自动（推荐）：系统证书链 -> certifi 回退
+  - 自动（推荐）：同时探测 HTTP 与 ASR 通道，自动选择可用策略
   - 系统证书链（企业网络优先）
   - 内置 certifi 证书链
   - 自定义 CA 文件（PEM）
+- 任务启动前会先做阿里云预检（API Key / 模型权限 / TLS 连通性），失败会在下载前直接提示。
+- ASR 在 websocket 证书失败时会自动切换到 HTTP 文件识别兜底（上传后识别），减少“仅语音识别阶段 TLS 失败”。
+- 失败时会在任务输出目录生成 `failure_report.txt`（包含异常链与 TLS 诊断），便于远程排障。
+- 翻译阶段已增加 JSON 容错与逐句回退，避免单批次格式异常导致整任务失败。
+- 默认不保留中间分段文件；仅在勾选“保留中间文件（调试）”时才会保留 `tmp` 目录。
 - `Qwen API Key` 首次输入后会保存到 `~/.video-dub-studio/config.json`，后续启动自动回填。
 - `cookies.txt` 路径同样会保存到 `~/.video-dub-studio/config.json`，便于下次直接复用。
 
@@ -75,3 +80,22 @@ SKIP_BUILD=1 ./gui_app/build_dmg.sh
 1. 在 `2) 配置输出` 把 `TLS 证书模式` 切到 `系统证书链（企业网络优先）` 后重试。
 2. 若仍失败，切到 `自定义 CA 文件（高级）`，导入公司代理/安全网关提供的 `PEM` 证书再试。
 3. 若依旧失败，关闭代理或切换网络测试，确认不是本地网络设备重签导致。
+
+## 一键环境诊断（推荐给“同事机器失败”的场景）
+
+### 1) 采集报告
+```bash
+cd "/Users/bytedance/Documents/codex project/youtube-cn-dub"
+./scripts/collect_vds_diag.sh
+```
+
+默认在桌面生成：`vds_diag_<hostname>_<timestamp>.txt`
+
+### 2) 对比两台机器报告
+```bash
+python3 ./scripts/compare_vds_diag.py /path/your_report.txt /path/friend_report.txt
+```
+
+建议同时提供：
+- `vds_diag_*.txt`（环境报告）
+- 任务目录下的 `failure_report.txt`（任务级异常链）

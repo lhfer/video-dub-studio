@@ -102,6 +102,32 @@ GUI 支持 TLS 模式切换：
 
 适用于企业代理 / 安全网关重签证书场景。
 
+### 3) 同公司机器表现不一致（你能跑、同事失败）
+请先用仓库内诊断脚本采集两台机器报告，再对比：
+
+```bash
+cd "/Users/bytedance/Documents/codex project/youtube-cn-dub"
+./scripts/collect_vds_diag.sh
+```
+
+默认会在桌面生成 `vds_diag_<hostname>_<timestamp>.txt`。  
+然后对比两份报告：
+
+```bash
+python3 ./scripts/compare_vds_diag.py /path/A.txt /path/B.txt
+```
+
+该报告会包含：
+- 代理配置（`scutil --proxy`）
+- DashScope 证书签发者（issuer）
+- Python `requests` / `aiohttp` 的 HTTP 与 WebSocket TLS 探测
+- certifi 与系统证书链差异
+
+另外，GUI 每次失败会在任务目录生成 `failure_report.txt`，也请一并提供。
+
+### 4) 文本翻译阶段 JSON 解析报错
+已在新版本加入翻译结果容错解析与逐句回退策略，避免因单批次返回格式异常导致整任务失败。
+
 ## 输出文件
 - `dubbed_audio.m4a`: 最终配音音频
 - `dubbed_video.mp4`: 新视频（原画面 + 新音轨）

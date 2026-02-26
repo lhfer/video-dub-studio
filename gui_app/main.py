@@ -43,7 +43,7 @@ from pipeline_runner import ConversionConfig, ConversionResult, fetch_youtube_pr
 
 APP_HOME = Path.home() / ".video-dub-studio"
 CONFIG_PATH = APP_HOME / "config.json"
-APP_VERSION = "0.3.22"
+APP_VERSION = "0.3.30"
 LANG_OPTIONS = [
     ("简体中文", "zh-CN"),
     ("English", "en-US"),
@@ -81,7 +81,7 @@ TOOLTIPS = {
     "output_dir": "转换结果输出目录。每次任务会生成独立时间戳子目录。",
     "youtube_cookies": "默认不读取浏览器登录态；仅在触发 YouTube 风控时按需使用。应用内置 JS challenge 运行时和增强解析策略。Safari 可能需要“完全磁盘访问”权限。",
     "cookies_file": "可选兜底方案。导入 Netscape 格式 cookies.txt 后，YouTube 风控环境下成功率更高。",
-    "tls_mode": "网络证书校验策略。默认“自动”会先尝试系统证书链，再回退内置 certifi。",
+    "tls_mode": "网络证书校验策略。默认“自动”会同时验证 HTTP 与 ASR 通道，并自动选择可用策略。",
     "ca_bundle_file": "仅在“自定义 CA 文件”模式下生效。选择 PEM 格式证书文件，用于企业代理/网关证书场景。",
     "max_seconds": "限制处理前 N 秒，0 表示处理完整音频。",
     "speaker_count": "高级参数。系统会自动识别说话人数；该值用于限制最多识别人数，填 1 可强制单人音色。",
@@ -739,6 +739,12 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.stage_label.setText("任务启动中...")
         self._append_log("开始执行转换任务")
+        self._append_log(
+            "网络策略: "
+            f"TLS={self.tls_mode_combo.currentData()} | "
+            f"cookies={self.cookies_combo.currentData()} | "
+            f"cookies.txt={'已设置' if self.cookies_file_input.text().strip() else '未设置'}"
+        )
 
         voices = self.voices_input.text().strip()
         preset = str(self.voice_preset_combo.currentData())
@@ -840,11 +846,50 @@ class MainWindow(QMainWindow):
         if is_tls_cert_error:
             display_err = (
                 f"{err}\n\n"
-                "检测到本机 TLS 证书链不完整或被企业代理重签。\n"
+                "检测到本机 TLS 证书链与应用运行时不一致。\n"
                 "建议按以下顺序重试：\n"
-                "1) 将「TLS 证书模式」改为“系统证书链（企业网络优先）”；\n"
-                "2) 若仍失败，改为“自定义 CA 文件”，并导入公司/代理提供的 PEM 证书；\n"
-                "3) 关闭代理或切换网络再试。"
+                "1) 将「TLS 证书模式」改为“自动（推荐）”；\n"
+                "2) 若仍失败，改为“内置 certifi 证书链”；\n"
+                "3) 企业网络下再尝试“自定义 CA 文件”，导入公司/代理提供的 PEM 证书；\n"
+                "4) 若 curl 可用但应用仍失败，删除本机配置后重启应用再试：\n"
+                f"   {CONFIG_PATH}\n"
+                "5) 关闭代理或切换网络再试。"
+            )
+        if ("阿里云预检失败：api key" in err) or ("api key 无效" in err) or ("authenticationerror" in err_lower):
+            display_err = (
+                f"{err}\n\n"
+                "请检查：\n"
+                "1) API Key 是否填写完整（无多余空格）；\n"
+                "2) 该 Key 是否已过期/被禁用；\n"
+                "3) 尽量使用个人独立 Key，不要多人共享同一个 Key。"
+            )
+        if ("无调用权限（403）" in err) or ("无该模型调用权限" in err):
+            display_err = (
+                f"{err}\n\n"
+                "当前账号没有目标模型权限。\n"
+                "请在阿里云百炼控制台确认：\n"
+                "- 翻译模型（如 qwen3-max）已开通\n"
+                "- TTS 模型（如 qwen3-tts-flash）已开通\n"
+                "- 所用 API Key 绑定的账号/项目具备调用权限"
+            )
+        if ("限流或额度不足" in err) or ("429" in err_lower) or ("quota" in err_lower):
+            display_err = (
+                f"{err}\n\n"
+                "这是限流/额度问题。\n"
+                "建议：\n"
+                "1) 稍后重试；\n"
+                "2) 更换独立 API Key；\n"
+                "3) 降低并发任务或处理更短片段。"
+            )
+        if ("模型不可用" in err) or ("model is not available" in err_lower) or ("unsupported model" in err_lower):
+            display_err = (
+                f"{err}\n\n"
+                "请更换可用模型，或在百炼控制台确认该模型对当前账号已开放。"
+            )
+        if ("代理需要认证（http 407）" in err_lower) or ("http 407" in err_lower):
+            display_err = (
+                f"{err}\n\n"
+                "当前网络有代理认证要求。请先完成代理登录，或切换到无需代理认证的网络后重试。"
             )
         self._append_log(f"任务失败: {err}")
 
